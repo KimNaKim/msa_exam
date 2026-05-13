@@ -1,69 +1,114 @@
-# MSA 기반 주문 및 재고 관리 시스템
+# MSA 기반 주문 및 재고 관리 시스템 (Saga 패턴 구현)
 
-이 프로젝트는 Spring Boot와 Kafka를 활용하여 Saga 패턴(Choreography-based)을 구현한 마이크로서비스 아키텍처(MSA) 예제입니다.
+이 프로젝트는 Spring Boot, Kafka, MySQL을 사용하여 마이크로서비스 아키텍처(MSA) 환경에서 데이터 일관성을 유지하는 **Choreography 기반 Saga 패턴**의 동작 원리를 구현하고 검증한 예제입니다.
 
-## 🏗 아키텍처 개요
+---
 
-- **Order Service**: 주문 생성 및 상태 관리를 담당합니다.
-- **Product Service**: 상품 관리 및 재고 차감을 담당합니다.
-- **Kafka**: 서비스 간 비동기 이벤트 통신을 위한 메시지 브로커입니다.
-- **MySQL**: 각 서비스의 데이터를 저장하는 데이터베이스입니다. (서비스별 독립 DB 사용)
+## 🏗 시스템 아키텍처 및 기술 스택
 
-## 🚀 구현된 주요 기능
+### 1. 서비스 구성 및 역할
+- **Product Service (Port 8081)**:
+    - 상품 정보 관리 및 실시간 재고 차감 로직 수행.
+    - **RESTful API 제공**: 외부 클라이언트 및 타 서비스(`Order Service` 등)가 상품 정보를 조회하거나 관리할 수 있도록 다양한 엔드포인트를 노출합니다.
+- **Order Service (Port 8082)**:
+    - 주문 생성 및 전체적인 주문 상태 관리.
+    - **REST Client 역할**: 필요 시 `Product Service`의 API를 호출하여 상품 정보를 확인하거나 검증하는 클라이언트 역할을 수행합니다.
+- **Kafka**: 서비스 간 비동기 메시지 전달을 위한 메시지 브로커.
+- **MySQL**: 각 서비스 전용 데이터베이스 (`product_db`, `order_db`).
 
-### 1. 주문 프로세스 (Saga 패턴 - Choreography)
-이 프로젝트는 분산 트랜잭션 환경에서 데이터 일관성을 유지하기 위해 **Choreography 기반 Saga 패턴**을 사용합니다. 각 서비스는 자신의 로컬 트랜잭션을 처리하고 이벤트를 발행하며, 다른 서비스의 이벤트를 구독하여 다음 단계를 처리합니다.
+### 2. 서비스 간 통신 방식
+이 시스템은 효율적인 데이터 처리와 일관성 유지를 위해 두 가지 통신 방식을 혼용합니다.
+- **동기 통신 (REST API)**: 데이터의 즉각적인 조회가 필요할 때 사용됩니다. `Product Service`는 API 서버로, `Order Service`는 클라이언트로 동작합니다.
+- **비동기 통신 (Kafka)**: Saga 패턴(Choreography)을 통한 트랜잭션 처리에 사용되며, 서비스 간의 결합도를 낮추고 시스템의 가용성을 높입니다.
 
-#### 정상 흐름 (Happy Path)
-1. **주문 생성**: `Order Service`에서 주문을 `PENDING` 상태로 DB에 저장하고 `order-create` 이벤트를 발행합니다.
-2. **재고 차감**: `Product Service`가 이벤트를 수신하여 DB의 재고를 차감하고 `product-stock-deducted` 이벤트를 발행합니다.
-3. **주문 완료**: `Order Service`가 이벤트를 수신하여 주문 상태를 `COMPLETED`로 변경합니다.
+### 3. Saga 패턴 (Choreography) 흐름
+이 시스템은 중앙의 제어자 없이 각 서비스가 이벤트를 주고받으며 로컬 트랜잭션을 처리하는 **Choreography 기반 Saga** 방식을 사용합니다.
 
-#### 보상 트랜잭션 (Compensating Transaction)
-분산 환경에서는 단일 데이터베이스의 ACID 트랜잭션을 사용할 수 없으므로, 하위 서비스에서 작업이 실패할 경우 이전 서비스들이 수행한 작업을 취소하거나 상태를 되돌리는 **보상 트랜잭션**이 필수적입니다.
+```mermaid
+sequenceDiagram
+    participant User
+    participant OrderService as Order Service (Port 8082)
+    participant Kafka
+    participant ProductService as Product Service (Port 8081)
 
-1. **실패 발생**: `Product Service`에서 재고가 부족하거나 상품을 찾을 수 없는 경우, 재고 차감 없이 `product-stock-failed` 이벤트를 발행합니다.
-2. **상태 롤백(보상)**: `Order Service`는 이 이벤트를 구독하고 있으며, 실패 이벤트를 수신하면 해당 주문의 상태를 `PENDING`에서 `CANCELLED`로 변경합니다.
-    - 이는 이미 커밋된 `PENDING` 상태의 주문을 논리적으로 취소(Undo)하는 작업입니다.
-3. **결과**: 최종적으로 주문 시스템과 재고 시스템 간의 데이터 일관성이 보장됩니다.
+    User->>OrderService: POST /api/orders (주문 요청)
+    OrderService->>OrderService: 주문 저장 (Status: PENDING)
+    OrderService->>Kafka: order-create (이벤트 발행)
+    
+    Kafka->>ProductService: order-create (이벤트 수신)
+    
+    alt 재고 있음 (정상)
+        ProductService->>ProductService: 재고 차감
+        ProductService->>Kafka: product-stock-deducted (성공 이벤트)
+        Kafka->>OrderService: product-stock-deducted (이벤트 수신)
+        OrderService->>OrderService: 주문 완료 (Status: COMPLETED)
+    else 재고 부족 (실패)
+        ProductService->>Kafka: product-stock-failed (실패 이벤트)
+        Note over Kafka, OrderService: 보상 트랜잭션 트리거
+        Kafka->>OrderService: product-stock-failed (이벤트 수신)
+        OrderService->>OrderService: 주문 취소 (Status: CANCELLED)
+    end
+```
 
-### 2. 서비스별 API
+1. **주문 접수**: 사용자가 `Order Service`에 주문 요청을 보냄 → 상태를 `PENDING`으로 저장.
+2. **이벤트 발행**: `Order Service`가 Kafka의 `order-create` 토픽에 이벤트를 발행.
+3. **재고 검증/차감**: `Product Service`가 이벤트를 수신 → 재고 확인 후 차감 성공 시 `product-stock-deducted` 발행 / 실패 시 `product-stock-failed` 발행.
+4. **최종 상태 업데이트**: `Order Service`가 결과 이벤트를 수신하여 주문 상태를 `COMPLETED` 또는 `CANCELLED`로 업데이트 (보상 트랜잭션).
 
-#### Order Service (`port 8082`)
-- `GET /api/orders`: 전체 주문 목록 조회
-- `POST /api/orders`: 새로운 주문 생성
-    - Body: `{"productId": 1, "quantity": 2}`
+---
 
-#### Product Service (`port 8081`)
-- `GET /api/products`: 전체 상품 목록 및 재고 조회
-- `POST /api/products`: 상품 등록
-- `POST /api/products/{id}/reduce-stock`: 수동 재고 차감 (테스트용)
+## 💡 보상 트랜잭션 (Compensating Transaction) 이란?
 
-## 🧪 테스트 시나리오
+MSA 환경에서는 여러 서비스에 걸친 하나의 비즈니스 로직을 전통적인 ACID 트랜잭션(2PC 등)으로 묶기 어렵습니다. 대신, 각 서비스의 로컬 트랜잭션이 실패했을 때 **이전의 성공한 단계들을 되돌리는 로직**을 실행하여 결과적으로 데이터 일관성을 맞추는 기법이 바로 **보상 트랜잭션**입니다.
 
-현재 구현된 로직을 바탕으로 다음과 같은 시나리오를 테스트할 수 있습니다.
+### 이 프로젝트의 보상 트랜잭션 구현 방식
+1. **의미적 취소(Semantic Undo)**: 이 프로젝트에서는 이미 DB에 `PENDING`으로 저장된 주문을 물리적으로 `DELETE`하지 않고, `CANCELLED`라는 상태값으로 변경함으로써 논리적으로 취소 처리합니다.
+2. **이벤트 기반 트리거**: `Product Service`에서 재고 부족 등의 이유로 로컬 트랜잭션이 실패하면 `product-stock-failed` 이벤트를 발행합니다.
+3. **최종적 일관성(Eventual Consistency)**: 주문 생성 시점과 취소 시점 사이에 짧은 간극이 존재하지만, 결국에는 `Order Service`의 상태가 올바르게 업데이트되어 전체 시스템의 데이터 일관성이 유지됩니다.
 
-### 시나리오 1: 주문 성공 (재고 충분)
-1. `GET /api/products`로 상품 ID와 현재 재고를 확인합니다.
-2. 재고보다 적은 수량으로 `POST /api/orders` 주문을 생성합니다.
-3. `GET /api/orders`를 조회하여 상태가 `PENDING` -> `COMPLETED`로 변경되는지 확인합니다.
-4. `GET /api/products`를 조회하여 재고가 주문 수량만큼 감소했는지 확인합니다.
+---
 
-### 시나리오 2: 주문 실패 (재고 부족)
-1. 재고보다 많은 수량으로 `POST /api/orders` 주문을 생성합니다.
-2. `GET /api/orders`를 조회하여 상태가 `PENDING` -> `CANCELLED`로 변경되는지 확인합니다.
-3. `GET /api/products`를 조회하여 재고가 변하지 않았는지 확인합니다.
+## 🧪 테스트 시나리오 및 실제 검증 결과
 
-### 시나리오 3: 존재하지 않는 상품 주문
-1. 존재하지 않는 `productId`로 주문을 생성합니다.
-2. `Product Service`에서 예외가 발생하고, `Order Service`에서 해당 주문이 `CANCELLED`로 처리되는지 확인합니다.
+모든 시나리오는 실제 로컬 환경에서 테스트되었으며, 다음과 같이 정상 동작함을 확인했습니다.
 
-## 🛠 실행 방법
+### 시나리오 1: 정상 주문 처리 (재고 충분)
+- **과정**:
+    1. 초기 재고 확인: `노트북(10개)`
+    2. 주문 요청: `노트북 2개` 주문 (`POST /api/orders`)
+- **결과**:
+    - `Product Service`: 재고가 **10개 → 8개**로 차감됨.
+    - `Order Service`: 주문 상태가 최종적으로 **`COMPLETED`**로 변경됨.
 
-1. **인프라 실행**: 프로젝트 루트에서 Docker Compose를 사용하여 MySQL과 Kafka를 실행합니다.
-   ```bash
-   docker-compose up -d
-   ```
-2. **서비스 실행**:
-   - `order-service`와 `product-service`를 각각 실행합니다. (Gradle bootRun 등)
-3. **데이터 초기화**: `infra/mysql/init/init.sql`이 컨테이너 실행 시 자동으로 로드되어 기본 상품 데이터가 생성됩니다.
+### 시나리오 2: 보상 트랜잭션 동작 (재고 부족)
+- **과정**:
+    1. 현재 재고 확인: `노트북(8개)`
+    2. 주문 요청: `노트북 100개` 주문 (재고보다 많은 수량)
+- **결과**:
+    - `Product Service`: 재고 부족 예외 발생 → `product-stock-failed` 이벤트 발행. 재고는 **8개로 유지**.
+    - `Order Service`: 실패 이벤트를 수신하여 이미 생성되었던 `PENDING` 주문을 **`CANCELLED`** 상태로 자동 변경. (데이터 일관성 보장 확인)
+
+---
+
+## 🛠 설치 및 실행 가이드
+
+### 1. 인프라 실행 (Docker)
+```bash
+# 기존 데이터가 꼬였을 경우 볼륨까지 삭제 후 재시작 권장
+docker-compose down -v
+docker-compose up -d
+```
+
+### 2. 애플리케이션 실행
+- `ProductServiceApplication` (8081) 실행
+- `OrderServiceApplication` (8082) 실행
+
+### 3. 주요 API 엔드포인트
+- **상품 조회**: `GET http://localhost:8081/api/products`
+- **주문 생성**: `POST http://localhost:8082/api/orders`
+    ```json
+    { "productId": 1, "quantity": 2 }
+    ```
+- **주문 목록**: `GET http://localhost:8082/api/orders`
+
+---
